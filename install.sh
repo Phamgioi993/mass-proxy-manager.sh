@@ -1,58 +1,80 @@
 #!/bin/bash
 
-# Kiểm tra quyền root
-if [[ "$EUID" -ne 0 ]]; then
-  echo "❌ Vui lòng chạy script với quyền root!"
-  exit 1
-fi
+# ==============================
+# Cài đặt Dante SOCKS5 Proxy
+# ==============================
 
-# Cài gói cần thiết
-apt update && apt install -y dante-server curl
+# Tự động đợi lock apt nếu đang bị chiếm dụng
+function wait_for_apt() {
+  while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+        fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+        fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    echo "Đang chờ apt unlock..."
+    sleep 3
+  done
+}
 
-# Phát hiện interface mạng
-INTERFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+# Tự động phát hiện interface chính
+function detect_interface() {
+  ip route get 8.8.8.8 | awk -- '{print $5; exit}'
+}
 
-# Tạo user ngẫu nhiên
-USERNAME="user$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 4)"
-PASSWORD="$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 12)"
-PORT=$((RANDOM % 10000 + 10000))  # random port từ 10000 đến 19999
+# Thực thi cài đặt
+wait_for_apt
+apt update -y && apt install -y dante-server net-tools
 
-# Tạo user cho Dante
-useradd -M -s /usr/sbin/nologin $USERNAME
-echo "$USERNAME:$PASSWORD" | chpasswd
+# Tạo user/pass random
+USERNAME="user$(openssl rand -hex 2)"
+PASSWORD="$(openssl rand -hex 4)"
 
-# Cấu hình Dante
-cat > /etc/danted.conf <<EOF
+# Phát hiện interface
+INTERFACE=$(detect_interface)
+PORT=1080
+
+# Backup cấu hình cũ nếu có
+mv /etc/danted.conf /etc/danted.conf.bak 2>/dev/null
+
+# Tạo cấu hình mới
+cat <<EOF > /etc/danted.conf
 logoutput: /var/log/danted.log
 internal: $INTERFACE port = $PORT
 external: $INTERFACE
 
-method: username
+method: username none
 user.notprivileged: nobody
 
 client pass {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
-  log: connect disconnect error
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
 }
 
-pass {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
-  protocol: tcp udp
-  method: username
-  log: connect disconnect error
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
+    command: connect
 }
 EOF
 
-# Bật dịch vụ Dante
-systemctl enable danted
+# Tạo user đăng nhập SOCKS5
+useradd -M -s /usr/sbin/nologin $USERNAME
+echo "$USERNAME:$PASSWORD" | chpasswd
+
+# Bật và khởi động dịch vụ
 systemctl restart danted
+systemctl enable danted
+
+# Mở port firewall nếu có UFW
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow $PORT/tcp
+fi
 
 # Lấy IP public
 IP=$(curl -s ipv4.icanhazip.com)
 
-# Hiển thị & lưu thông tin
+# Hiển thị thông tin
+echo ""
 echo -e "✅ SOCKS5 Proxy đã được cài đặt thành công!"
 echo -e "🔐 Proxy: $IP:$PORT:$USERNAME:$PASSWORD"
 
-echo "$IP:$PORT:$USERNAME:$PASSWORD" > /root/proxy-credentials.txt
-echo "socks5://$USERNAME:$PASSWORD@$IP:$PORT" > /root/proxy-connection.txt
+# Lưu thông tin ra file
+echo "$IP:$PORT:$USERNAME:$PASSWORD" > proxy-info.txt
